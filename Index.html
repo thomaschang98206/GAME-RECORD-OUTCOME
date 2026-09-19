@@ -34,13 +34,13 @@ iframe.active{display:block}
   <button id="scoreBtn" class="active" type="button">正式紀錄單</button>
   <button id="heatBtn" type="button">投打 25 宮格</button>
   <button id="pdfBtn" type="button">目前頁面存成 PDF</button>
-  <span class="status" id="status">2026-09-19｜白隊 vs 我方</span>
+  <span class="status" id="status">2026-09-19｜白隊 vs 我方</span><span class="status" id="decodeStatus">文字編碼：內建資料</span>
 </div>
 
 <div class="note">
   一次載入同一份比賽 JSON，即可在「正式紀錄單」與「投打 25 宮格」之間切換。
   25 宮格固定標示為<strong>捕手視角</strong>，左側為三壘側、右側為一壘側。
-  PDF 按鈕會列印目前正在看的頁面。
+  PDF 按鈕會列印目前正在看的頁面。載入 JSON 時會自動依序嘗試 UTF-8、UTF-8 fallback、Big5/CP950，並保守修復常見 UTF-8→Latin-1 亂碼；若是 9/19 那種「白隊打序只輸入兩人」造成的姓名錯置，則由比賽修復規則處理，兩者不混為一談。
 </div>
 
 <div class="viewer">
@@ -1164,17 +1164,95 @@ heatBtn.addEventListener("click", () => setView("heat"));
 scoreFrame.addEventListener("load", () => sendGame(scoreFrame));
 heatFrame.addEventListener("load", () => sendGame(heatFrame));
 
+
+function countBadChars(s) {
+  const replacement = (s.match(/\uFFFD/g) || []).length;
+  const mojibake = (s.match(/[ÃÂâ€žåæçèéêëìíîïðñòóôõöøùúûüýþÿ]/g) || []).length;
+  return replacement * 10 + mojibake;
+}
+
+function tryUtf8MojibakeRepair(text) {
+  // 僅在「看起來像 UTF-8 bytes 被當 Latin-1/Windows-1252 解讀」時嘗試。
+  // 若修復後壞字指標沒有下降，就完全不採用，避免把正常中文改壞。
+  try {
+    const bytes = Uint8Array.from([...text].map(ch => ch.charCodeAt(0) & 0xFF));
+    const repaired = new TextDecoder("utf-8", {fatal:true}).decode(bytes);
+    return countBadChars(repaired) < countBadChars(text) ? repaired : text;
+  } catch (_) {
+    return text;
+  }
+}
+
+function normalizeStringsDeep(value) {
+  if (typeof value === "string") return tryUtf8MojibakeRepair(value).normalize("NFC");
+  if (Array.isArray(value)) return value.map(normalizeStringsDeep);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [k,v] of Object.entries(value)) {
+      const nk = tryUtf8MojibakeRepair(String(k)).normalize("NFC");
+      out[nk] = normalizeStringsDeep(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+async function decodeJsonFile(file) {
+  const buf = await file.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+
+  const attempts = [
+    {label:"UTF-8", encoding:"utf-8", fatal:true},
+    {label:"UTF-8（寬鬆）", encoding:"utf-8", fatal:false},
+    {label:"Big5 / CP950", encoding:"big5", fatal:false}
+  ];
+
+  let best = null;
+  for (const a of attempts) {
+    try {
+      const text = new TextDecoder(a.encoding, {fatal:a.fatal}).decode(bytes).replace(/^\uFEFF/, "");
+      const parsed = JSON.parse(text);
+      const normalized = normalizeStringsDeep(parsed);
+      const bad = countBadChars(JSON.stringify(normalized));
+      if (!best || bad < best.bad) best = {game:normalized, label:a.label, bad};
+      if (bad === 0 && a.label === "UTF-8") break;
+    } catch (_) {}
+  }
+
+  if (!best) {
+    // 最後再試瀏覽器原生 File.text()，提供最寬容的 fallback。
+    const text = (await file.text()).replace(/^\uFEFF/, "");
+    best = {game:normalizeStringsDeep(JSON.parse(text)), label:"瀏覽器文字解碼 fallback", bad:countBadChars(text)};
+  }
+  return best;
+}
+
+function applySharedDataRepairs(game) {
+  // 這裡只做「可明確辨識且已確認」的資料修復。
+  // 9/19 的姓名問題不是文字編碼亂碼，而是白隊 lineup 只輸入前兩棒造成的循環錯置。
+  // 正式紀錄單與熱力圖子工具本身會再套用該場已確認的打序重建規則。
+  return game;
+}
+
 document.getElementById("jsonFile").addEventListener("change", async (e) => {
   const f = e.target.files[0];
   if (!f) return;
   try {
-    currentGame = JSON.parse(await f.text());
+    const decoded = await decodeJsonFile(f);
+    currentGame = applySharedDataRepairs(decoded.game);
     sendGame(scoreFrame);
     sendGame(heatFrame);
+
     const away = currentGame.teams?.away?.name || "客隊";
     const home = currentGame.teams?.home?.name || "主隊";
     document.getElementById("status").textContent = `${currentGame.date || ""}｜${away} vs ${home}`;
+
+    const repairNote = decoded.bad > 0
+      ? `文字編碼：${decoded.label}；仍偵測到 ${decoded.bad} 個疑似異常字元`
+      : `文字編碼：${decoded.label}；未偵測到亂碼`;
+    document.getElementById("decodeStatus").textContent = repairNote;
   } catch (err) {
+    document.getElementById("decodeStatus").textContent = "文字編碼：讀取失敗";
     alert("JSON 讀取失敗：" + err.message);
   }
 });
